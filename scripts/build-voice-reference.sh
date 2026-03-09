@@ -1,44 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve workspace root from script path
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
 
-# Load GOG vars from file if not in environment
-if [[ -z "${GOG_ACCOUNT:-}" || -z "${GOG_KEYRING_PASSWORD:-}" ]]; then
-  for envfile in "$WORKSPACE_ROOT/gmail-secretary.env" \
-                 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/gmail-secretary.env"; do
-    if [[ -r "$envfile" ]]; then
-      set -a
-      source "$envfile"
-      set +a
-      break
-    fi
-  done
-fi
+gs_require_config
+gs_prepare_cache_dir
 
-GOG_BIN="${GOG_BIN:-gog}"
-ACCOUNT="${GOG_ACCOUNT:?Set GOG_ACCOUNT and create workspace/gmail-secretary.env}"
-export GOG_KEYRING_PASSWORD="${GOG_KEYRING_PASSWORD:?Set GOG_KEYRING_PASSWORD in workspace/gmail-secretary.env}"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_DIR="$(dirname "$SCRIPT_DIR")"
-OUT_DIR="$SKILL_DIR/references"
-OUT="$OUT_DIR/voice.md"
-mkdir -p "$OUT_DIR"
+OUT="$CACHE_DIR/gmail-voice-reference.md"
 
 TMP_IDS=$(mktemp)
 trap 'rm -f "$TMP_IDS"' EXIT
 
-# Get 50 recent sent message IDs.
 "$GOG_BIN" gmail messages search \
   'in:sent newer_than:180d' \
   --max 50 \
-  --account "$ACCOUNT" \
+  --account "$GOG_ACCOUNT" \
   --json > "$TMP_IDS"
 
-TMP_IDS_JSON="$TMP_IDS" OUT="$OUT" ACCOUNT="$ACCOUNT" GOG_BIN="$GOG_BIN" node - <<'NODE'
+TMP_IDS_JSON="$TMP_IDS" OUT="$OUT" ACCOUNT="$GOG_ACCOUNT" GOG_BIN="$GOG_BIN" node - <<'NODE'
 const fs=require('fs');
 const cp=require('child_process');
 
@@ -79,9 +59,12 @@ for (const id of ids){
     sn = sn
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig,'[email]')
       .replace(/\b\+?1?[-. (]*\d{3}[-. )]*\d{3}[-. ]*\d{4}\b/g,'[phone]')
-      .replace(/\bLinkedIn\b/ig,'[link]');
+      .replace(/\bLinkedIn\b/ig,'[link]')
+      .replace(/\bClass of \d{4}\b/ig,'[school-signature]')
+      .replace(/\bWarm regards,\b/ig,'[signoff]')
+      .replace(/\bBest regards,\b/ig,'[signoff]');
     if (!sn) continue;
-    samples.push({subject,to,date,snippet:sn.slice(0,600)});
+    samples.push({subject,to,date,snippet:sn.slice(0,320)});
   } catch (e){
     // ignore individual failures
   }
@@ -120,3 +103,5 @@ for (const s of samples.slice(0,15)){
 
 fs.writeFileSync(process.env.OUT, lines.join('\n')+'\n');
 NODE
+
+gs_secure_file "$OUT"

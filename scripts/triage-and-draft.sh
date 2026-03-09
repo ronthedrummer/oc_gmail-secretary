@@ -1,58 +1,134 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve workspace root from script path (so we don't rely on HOME when gateway runs without shell env)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-WORKSPACE="${OPENCLAW_WORKSPACE:-$WORKSPACE_ROOT}"
+source "$SCRIPT_DIR/lib/common.sh"
 
-# Load GOG vars from file if not in environment (gateway often has no GOG_* when not started from your shell)
-if [[ -z "${GOG_ACCOUNT:-}" || -z "${GOG_KEYRING_PASSWORD:-}" ]]; then
-  for envfile in "$WORKSPACE_ROOT/gmail-secretary.env" \
-                 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/gmail-secretary.env"; do
-    if [[ -r "$envfile" ]]; then
-      set -a
-      source "$envfile"
-      set +a
-      break
-    fi
-  done
-fi
+gs_require_config
+gs_prepare_cache_dir
 
-GOG_BIN="${GOG_BIN:-gog}"
-ACCOUNT="${GOG_ACCOUNT:?Set GOG_ACCOUNT and create workspace/gmail-secretary.env (see skill SKILL.md)}"
-export GOG_KEYRING_PASSWORD="${GOG_KEYRING_PASSWORD:?Set GOG_KEYRING_PASSWORD in workspace/gmail-secretary.env}"
+QUERY="${GMAIL_SECRETARY_QUERY:-in:inbox (is:unread OR newer_than:2d)}"
+FETCH_MAX="${GMAIL_SECRETARY_FETCH_MAX:-30}"
+THREAD_LIMIT="${GMAIL_SECRETARY_THREAD_LIMIT:-20}"
+INDEX_OUT="$CACHE_DIR/gmail-inbox-index.json"
+SUMMARIES_OUT="$CACHE_DIR/gmail-inbox-summaries.json"
+TMP_INBOX="$(mktemp)"
+trap 'rm -f "$TMP_INBOX"' EXIT
 
-CACHE="$WORKSPACE/cache"
-INBOX_CACHE="$CACHE/gmail-inbox-raw.json"
-SUMMARIES_OUT="$CACHE/gmail-inbox-summaries.json"
-mkdir -p "$CACHE"
-
-# Step 1: Fetch inbox
 "$GOG_BIN" gmail messages search \
-  'in:inbox (is:unread OR newer_than:2d)' \
-  --max 20 \
-  --account "$ACCOUNT" \
-  --json > "$INBOX_CACHE"
+  "$QUERY" \
+  --max "$FETCH_MAX" \
+  --account "$GOG_ACCOUNT" \
+  --json > "$TMP_INBOX"
 
-# Step 2: Extract summaries for LLM classification
-node -e "
-const fs=require('fs');
-const raw=JSON.parse(fs.readFileSync('$INBOX_CACHE','utf8'));
-const msgs=Array.isArray(raw)?raw:(raw?.messages||raw?.items||[]);
-const out=msgs.slice(0,12).map((m,i)=>{
-  function pick(o,ks){for(const k of ks){if(o&&o[k]!=null)return o[k]}return null}
-  function hdr(o,n){const hs=o?.payload?.headers||o?.headers;if(Array.isArray(hs)){const h=hs.find(x=>(x?.name||'').toLowerCase()===n.toLowerCase());return h?.value||null}return null}
-  const subj=hdr(m,'Subject')||pick(m,['subject'])||'(no subject)';
-  const from=hdr(m,'From')||pick(m,['from'])||'(unknown)';
-  const snip=(pick(m,['snippet','text','preview'])||'').replace(/\s+/g,' ').trim().slice(0,200);
-  const id=pick(m,['id','messageId'])||'';
-  const threadId=pick(m,['threadId'])||id;
-  const date=hdr(m,'Date')||pick(m,['date','internalDate'])||'';
-  return {i,id,threadId,subj,from,snip,date};
-});
-fs.writeFileSync('$SUMMARIES_OUT',JSON.stringify(out,null,2));
-console.log('Extracted '+out.length+' email summaries');
-"
+TMP_INBOX="$TMP_INBOX" INDEX_OUT="$INDEX_OUT" SUMMARIES_OUT="$SUMMARIES_OUT" QUERY="$QUERY" THREAD_LIMIT="$THREAD_LIMIT" node - <<'NODE'
+const fs = require('fs');
 
-echo "Inbox fetched. Ready for agent classification."
+function readJson(path) {
+  return JSON.parse(fs.readFileSync(path, 'utf8'));
+}
+
+function pick(o, keys) {
+  for (const key of keys) {
+    if (o && o[key] != null) {
+      return o[key];
+    }
+  }
+  return null;
+}
+
+function headerValue(message, name) {
+  const headers = message?.payload?.headers || message?.headers;
+  if (!Array.isArray(headers)) {
+    return null;
+  }
+  const match = headers.find((header) => String(header?.name || '').toLowerCase() === name.toLowerCase());
+  return match?.value || null;
+}
+
+function parseTimestamp(message) {
+  const raw = pick(message, ['internalDate', 'internal_date', 'timestamp']);
+  if (raw == null || raw === '') {
+    return 0;
+  }
+  const value = Number(raw);
+  if (Number.isFinite(value) && value > 0) {
+    return value > 1000000000000 ? value : value * 1000;
+  }
+  const parsed = Date.parse(String(raw));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeMessage(message) {
+  const messageId = pick(message, ['id', 'messageId']) || '';
+  const threadId = pick(message, ['threadId']) || messageId;
+  const subject = headerValue(message, 'Subject') || pick(message, ['subject']) || '(no subject)';
+  const from = headerValue(message, 'From') || pick(message, ['from']) || '(unknown)';
+  const date = headerValue(message, 'Date') || pick(message, ['date']) || '';
+  const snippet = String(pick(message, ['snippet', 'preview', 'text']) || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240);
+  const labelIds = Array.isArray(message?.labelIds) ? message.labelIds : [];
+  const internalDate = parseTimestamp(message);
+  return {
+    threadId,
+    messageId,
+    subject,
+    from,
+    date,
+    snippet,
+    labelIds,
+    internalDate,
+    hasUnread: labelIds.includes('UNREAD')
+  };
+}
+
+const raw = readJson(process.env.TMP_INBOX);
+const sourceMessages = Array.isArray(raw) ? raw : (raw?.messages || raw?.items || raw?.threads || []);
+const perThread = new Map();
+
+for (const message of sourceMessages) {
+  const normalized = normalizeMessage(message);
+  if (!normalized.threadId) {
+    continue;
+  }
+  const previous = perThread.get(normalized.threadId);
+  if (!previous || normalized.internalDate >= previous.internalDate) {
+    perThread.set(normalized.threadId, normalized);
+  }
+}
+
+const threadLimit = Number(process.env.THREAD_LIMIT || 20);
+const items = Array.from(perThread.values())
+  .sort((left, right) => right.internalDate - left.internalDate)
+  .slice(0, threadLimit)
+  .map((item, index) => ({
+    index,
+    threadId: item.threadId,
+    messageId: item.messageId,
+    subject: item.subject,
+    from: item.from,
+    date: item.date,
+    snippet: item.snippet,
+    labelIds: item.labelIds,
+    hasUnread: item.hasUnread
+  }));
+
+const indexPayload = {
+  generatedAt: new Date().toISOString(),
+  query: process.env.QUERY,
+  itemCount: items.length,
+  items
+};
+
+fs.writeFileSync(process.env.INDEX_OUT, JSON.stringify(indexPayload, null, 2) + '\n');
+fs.writeFileSync(process.env.SUMMARIES_OUT, JSON.stringify(items, null, 2) + '\n');
+NODE
+
+gs_secure_file "$INDEX_OUT"
+gs_secure_file "$SUMMARIES_OUT"
+
+echo "Inbox index written to $INDEX_OUT"
+echo "Compatibility summaries written to $SUMMARIES_OUT"
+echo "Next step: review the index, fetch full threads only when needed, then write cache/gmail-triage-plan.json."

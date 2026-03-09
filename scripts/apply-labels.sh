@@ -1,72 +1,148 @@
 #!/usr/bin/env bash
-# Apply labels from agent classification results
-# Input: cache/gmail-triage-labels.json (written by the agent)
-# Format: [{"index":0,"id":"...","threadId":"...","label":"...","needsReply":true/false}, ...]
 set -euo pipefail
 
-# Resolve workspace root from script path
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-WORKSPACE="${OPENCLAW_WORKSPACE:-$WORKSPACE_ROOT}"
+source "$SCRIPT_DIR/lib/common.sh"
 
-# Load GOG vars from file if not in environment
-if [[ -z "${GOG_ACCOUNT:-}" || -z "${GOG_KEYRING_PASSWORD:-}" ]]; then
-  for envfile in "$WORKSPACE_ROOT/gmail-secretary.env" \
-                 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/gmail-secretary.env"; do
-    if [[ -r "$envfile" ]]; then
-      set -a
-      source "$envfile"
-      set +a
-      break
-    fi
-  done
+gs_require_config
+gs_prepare_cache_dir
+
+PLAN_FILE="${GMAIL_SECRETARY_PLAN_FILE:-$CACHE_DIR/gmail-triage-plan.json}"
+LEGACY_FILE="$CACHE_DIR/gmail-triage-labels.json"
+REPORT_FILE="$CACHE_DIR/gmail-label-apply-report.json"
+
+if [[ ! -f "$PLAN_FILE" ]]; then
+  if [[ -f "$LEGACY_FILE" ]]; then
+    PLAN_FILE="$LEGACY_FILE"
+  else
+    echo "No triage plan found at $PLAN_FILE or $LEGACY_FILE" >&2
+    exit 1
+  fi
 fi
 
-GOG_BIN="${GOG_BIN:-gog}"
-ACCOUNT="${GOG_ACCOUNT:?Set GOG_ACCOUNT and create workspace/gmail-secretary.env}"
-export GOG_KEYRING_PASSWORD="${GOG_KEYRING_PASSWORD:?Set GOG_KEYRING_PASSWORD in workspace/gmail-secretary.env}"
+PLAN_FILE="$PLAN_FILE" REPORT_FILE="$REPORT_FILE" GOG_BIN="$GOG_BIN" ACCOUNT="$GOG_ACCOUNT" node - <<'NODE'
+const fs = require('fs');
+const cp = require('child_process');
 
-LABELS_FILE="$WORKSPACE/cache/gmail-triage-labels.json"
+const account = process.env.ACCOUNT;
+const gogBin = process.env.GOG_BIN || 'gog';
+const planPath = process.env.PLAN_FILE;
+const reportPath = process.env.REPORT_FILE;
+const allowedLabels = ['Urgent', 'Needs Reply', 'Waiting On', 'Read Later', 'Receipt / Billing', 'Admin / Accounts'];
+const allowedActions = new Set(['none', 'review', 'reply']);
 
-if [ ! -f "$LABELS_FILE" ]; then
-  echo "No labels file found at $LABELS_FILE"
-  exit 1
-fi
-
-LABELS_FILE="$LABELS_FILE" GOG_BIN="$GOG_BIN" ACCOUNT="$ACCOUNT" node -e "
-const fs=require('fs');
-const cp=require('child_process');
-const path=require('path');
-const account=process.env.ACCOUNT;
-const gogBin=process.env.GOG_BIN||'gog';
-const labelsPath=process.env.LABELS_FILE;
-
-const labels=JSON.parse(fs.readFileSync(labelsPath,'utf8'));
-
-function run(args){
-  try{return cp.execFileSync(gogBin,args,{encoding:'utf8',stdio:['ignore','pipe','pipe']})}catch{return ''}
+function readJson(path) {
+  return JSON.parse(fs.readFileSync(path, 'utf8'));
 }
 
-// Ensure labels exist (skill defaults; add more in LABELS if needed)
-const LABELS=['Urgent','Needs Reply','Waiting On','Read Later','Receipt / Billing','Admin / Accounts'];
-let existing=[];
-try{const t=run(['gmail','labels','list','--account',account,'--json']);const o=JSON.parse(t);existing=(o.labels||o||[]).map(x=>x.name).filter(Boolean)}catch{}
-for(const name of LABELS){if(!existing.includes(name)){try{run(['gmail','labels','create',name,'--account',account,'--json'])}catch{}}}
+function run(args) {
+  return cp.execFileSync(gogBin, args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+}
 
-// Apply — supports both formats:
-// Old: {label:\"X\", needsReply:bool}
-// New: {labels:[\"X\",\"Y\"], action:\"review\"|\"reply\"|\"none\"}
-let applied=0;
-for(const l of labels){
-  if(!l.threadId)continue;
-  let toApply=[];
-  if(Array.isArray(l.labels)){toApply=l.labels.filter(x=>LABELS.includes(x))}
-  else if(l.label&&LABELS.includes(l.label)){toApply=[l.label]}
-  const needsReply=l.needsReply||(l.action==='reply');
-  if(needsReply&&!toApply.includes('Needs Reply')){toApply.push('Needs Reply')}
-  for(const lab of toApply){
-    try{run(['gmail','labels','modify',l.threadId,'--add',lab,'--account',account,'--json']);applied++}catch{}
+function normalizePlan(input) {
+  const items = Array.isArray(input) ? input : (Array.isArray(input?.items) ? input.items : []);
+  return items.map((entry, index) => {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error(`Plan entry ${index} is not an object`);
+    }
+    const threadId = String(entry.threadId || '').trim();
+    if (threadId === '') {
+      throw new Error(`Plan entry ${index} is missing threadId`);
+    }
+
+    const labels = [];
+    if (Array.isArray(entry.labels)) {
+      labels.push(...entry.labels);
+    } else if (typeof entry.label === 'string' && entry.label.trim() !== '') {
+      labels.push(entry.label);
+    }
+
+    const action = entry.action == null ? (entry.needsReply ? 'reply' : 'none') : String(entry.action);
+    if (!allowedActions.has(action)) {
+      throw new Error(`Plan entry ${index} has unsupported action '${action}'`);
+    }
+
+    const normalizedLabels = [...new Set(labels.map((label) => String(label).trim()).filter(Boolean))];
+    for (const label of normalizedLabels) {
+      if (!allowedLabels.includes(label)) {
+        throw new Error(`Plan entry ${index} uses unsupported label '${label}'`);
+      }
+    }
+
+    if (action === 'reply' && !normalizedLabels.includes('Needs Reply')) {
+      normalizedLabels.push('Needs Reply');
+    }
+
+    return {
+      threadId,
+      labels: normalizedLabels
+    };
+  });
+}
+
+const plan = normalizePlan(readJson(planPath));
+const mergedByThread = new Map();
+
+for (const entry of plan) {
+  const existing = mergedByThread.get(entry.threadId) || new Set();
+  for (const label of entry.labels) {
+    existing.add(label);
+  }
+  mergedByThread.set(entry.threadId, existing);
+}
+
+const threadSummaries = Array.from(mergedByThread.entries()).map(([threadId, labels]) => ({
+  threadId,
+  labels: Array.from(labels)
+}));
+const labelOperations = threadSummaries.flatMap((entry) =>
+  entry.labels.map((label) => ({ threadId: entry.threadId, label }))
+);
+
+const existingLabelResponse = JSON.parse(run(['gmail', 'labels', 'list', '--account', account, '--json']));
+const existingLabels = new Set((existingLabelResponse?.labels || existingLabelResponse || []).map((item) => item?.name).filter(Boolean));
+
+for (const label of allowedLabels) {
+  if (!existingLabels.has(label)) {
+    run(['gmail', 'labels', 'create', label, '--account', account, '--json']);
+    existingLabels.add(label);
   }
 }
-console.log('Applied labels to '+applied+' threads');
-"
+
+const failures = [];
+let applied = 0;
+for (const op of labelOperations) {
+  try {
+    run(['gmail', 'labels', 'modify', op.threadId, '--add', op.label, '--account', account, '--json']);
+    applied += 1;
+  } catch (error) {
+    failures.push({
+      threadId: op.threadId,
+      label: op.label,
+      message: error.stderr ? String(error.stderr).trim() : String(error.message || error)
+    });
+  }
+}
+
+const report = {
+  generatedAt: new Date().toISOString(),
+  applied,
+  threadCount: threadSummaries.length,
+  operations: threadSummaries,
+  failures
+};
+
+fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n');
+if (failures.length > 0) {
+  throw new Error(`Failed to apply ${failures.length} label updates. See ${reportPath}`);
+}
+
+console.log(`Applied ${applied} labels across ${threadSummaries.length} threads`);
+NODE
+
+gs_secure_file "$REPORT_FILE"
+
+echo "Label report written to $REPORT_FILE"

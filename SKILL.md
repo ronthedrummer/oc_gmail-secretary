@@ -1,15 +1,44 @@
 ---
 name: gmail-secretary
-description: Gmail triage assistant using the main agent (OpenAI) for classification, label application, and draft replies (uses gog CLI; never auto-sends).
+description: Gmail triage assistant using the main agent (OpenAI) for metadata-first triage, selective thread fetches, label application, and draft replies (uses gog CLI; never auto-sends).
 metadata:
   {"openclaw": {"always": true}}
 ---
 
 # Gmail Secretary
 
+## Recommended architecture
+
+For a single mailbox, this skill uses **user OAuth** through `gog` and keeps Gmail access on the trusted host machine. The agent should reason over normalized JSON files, not over direct Gmail API calls.
+
+If this grows into a shared inbox or multi-user Workspace tool, revisit the auth model and likely move to a service account plus domain-wide delegation or a dedicated backend.
+
+## Trust boundary
+
+Treat this skill as a narrow host-side Gmail bridge:
+
+- `gog` runs on the gateway host and is the only component that talks to Gmail.
+- The agent reads and writes normalized files in `cache/`.
+- Raw Gmail API output should stay ephemeral whenever possible.
+- `gmail-secretary.env` is parsed as plain `KEY=value` data. It is **not** sourced as shell code.
+
+Persisted local artifacts:
+
+- `cache/gmail-inbox-index.json`: metadata-first triage input.
+- `cache/gmail-thread-details.json`: selected full-thread context only.
+- `cache/gmail-triage-plan.json`: structured agent decisions.
+- `cache/gmail-draft-results.json`: draft creation results.
+- `cache/gmail-drafts.md`: human-readable draft summary.
+- `cache/gmail-label-apply-report.json`: label mutation report.
+- `cache/gmail-voice-reference.md`: local drafting-style reference.
+
+Do not commit any of the files above.
+
 ## Setup & Gmail auth
 
 Do this once before using the skill.
+
+If you want a user-facing setup walkthrough tailored to the OpenClaw gateway host, start with `README.md`.
 
 ### 1. Install gog
 
@@ -20,44 +49,39 @@ gog --help
 
 ### 2. Create Google OAuth credentials
 
-1. Open [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Credentials.
-2. Create project (or pick one) → Create credentials → **OAuth 2.0 Client ID**.
+1. Open [Google Cloud Console](https://console.cloud.google.com/) -> APIs & Services -> Credentials.
+2. Create project (or pick one) -> Create credentials -> **OAuth 2.0 Client ID**.
 3. If prompted, configure the OAuth consent screen (External, add your Gmail as test user).
-4. Application type: **Desktop app**. Download the JSON (e.g. `credentials.json`).
+4. Application type: **Desktop app**. Download the JSON (for example `credentials.json`).
 
 ### 3. Register credentials and add your account
 
 ```bash
-# Point gog at your client secret (copy to ~/.config/gogcli/)
 gog auth credentials /path/to/credentials.json
-
-# Add your Gmail account and request Gmail scope
 gog auth add your-email@gmail.com --services gmail
 ```
 
-A browser window opens; sign in and allow access. For a headless/server machine use:
+For a headless machine:
 
 ```bash
 GOG_KEYRING_PASSWORD="your-secret" gog auth add your-email@gmail.com --services gmail --manual --force-consent
 ```
 
-Then open the URL it prints, approve, and paste the authorization code back.
+### 4. Create `gmail-secretary.env`
 
-### 4. Set GOG variables (required for the agent)
+Create `gmail-secretary.env` in the OpenClaw workspace root (preferred) or `~/.openclaw/`:
 
-The gateway process usually **does not** inherit your shell’s environment, so `GOG_ACCOUNT` and `GOG_KEYRING_PASSWORD` are often missing when the agent runs the skill. Use a **env file** so the scripts can load them:
+```bash
+GOG_ACCOUNT="your-email@gmail.com"
+GOG_KEYRING_PASSWORD="your-keyring-password"
+```
 
-1. Create **`gmail-secretary.env` in your OpenClaw workspace root** (e.g. `~/.openclaw/workspace/gmail-secretary.env`). The scripts resolve this path from the script location, so it works even when `HOME` is not what you expect. Copy from `skills/gmail-secretary/gmail-secretary.env.example` and fill in your values.
-   ```bash
-   GOG_ACCOUNT="your-email@gmail.com"
-   GOG_KEYRING_PASSWORD="your-keyring-password"
-   ```
-2. Restrict access: **`chmod 600 .../workspace/gmail-secretary.env`**
-3. The workspace `.gitignore` already includes `gmail-secretary.env`; do not commit this file.
+Rules:
 
-The scripts look for the env file in the workspace root first, then in `~/.openclaw/`. Prefer the workspace file so the path is always found.
-
-**Why it works for others but not you:** Many people start the gateway from a terminal where they’ve run `export GOG_ACCOUNT=...` and `export GOG_KEYRING_PASSWORD=...` (e.g. in `~/.zshrc`). The gateway then inherits those. If you start the gateway from Cursor, launchd, or similar, it has no GOG vars, so the skill needs the env file in the workspace.
+- Use only `KEY=value` entries.
+- Supported keys are `GOG_ACCOUNT`, `GOG_KEYRING_PASSWORD`, and optional `GOG_BIN`.
+- Restrict access with `chmod 600 gmail-secretary.env`.
+- Do not add shell commands, backticks, or substitutions; the parser rejects them.
 
 ### 5. Verify
 
@@ -68,32 +92,29 @@ gog auth list
 gog gmail messages search "in:inbox" --max 1 --account "$GOG_ACCOUNT" --json
 ```
 
-If that returns one message (or an empty list), auth is working. Then run from the workspace:
+Or run the repo health check:
 
 ```bash
-cd ~/.openclaw/workspace/skills/gmail-secretary
-./scripts/triage-and-draft.sh
+./scripts/check-gmail-auth.sh
 ```
 
-### 6. When the agent runs the skill (OpenClaw chat)
+### 6. OpenClaw runtime notes
 
-- **Env file in workspace:** Create `gmail-secretary.env` in the workspace root (step 4). The scripts look there first so the agent can run gog even when the gateway was not started from your shell.
-
-- **Exec on host:** In `openclaw.json`, set `tools.exec.host` to `"gateway"` so exec runs on the same machine as the gateway (not in a sandbox). The script then sees your real filesystem and can read the workspace env file and run `gog` from your PATH (or `pathPrepend`).
-
-- **PATH:** If `gog` is from Homebrew, `tools.exec.pathPrepend: ["/opt/homebrew/bin"]` in `openclaw.json` ensures exec finds it. On Intel Mac use `/usr/local/bin` if needed.
-
-If the CLI works but the agent does not, the usual cause is either (1) no env file where the script can find it (use workspace root), or (2) exec running in a context that cannot see the file (use `tools.exec.host: "gateway"`).
-
----
+- Keep exec on the host machine (`tools.exec.host: "gateway"`).
+- Ensure the host PATH can find `gog`.
+- If the CLI works manually but the skill does not, the usual causes are a missing `gmail-secretary.env` or exec running outside the gateway host context.
 
 ## Safety rules (non-negotiable)
-- **Never send email automatically.** Only create drafts + summaries.
-- Prefer **labels** over moving/deleting.
-- Keep the voice reference **style-focused** (patterns + a few short redacted snippets), not a full archive.
 
-## Labels (user-friendly)
-Use/create these labels:
+- Never send email automatically. Only create drafts and summaries.
+- Prefer labels over moving or deleting mail.
+- Fetch full thread bodies only for selected threads that need deeper reasoning.
+- Keep the voice reference style-focused and local-only.
+
+## Labels
+
+Use only these labels:
+
 - Urgent
 - Needs Reply
 - Waiting On
@@ -101,45 +122,150 @@ Use/create these labels:
 - Receipt / Billing
 - Admin / Accounts
 
-## Classification: Main agent (OpenAI)
-Classification uses the **main OpenClaw agent** (your configured OpenAI model). No separate Haiku or other provider.
-- `scripts/triage-and-draft.sh` fetches inbox → writes summaries to `cache/gmail-inbox-summaries.json`
-- You (or a tool) ask the main agent to read `cache/gmail-inbox-summaries.json`, classify each email, and write results to `cache/gmail-triage-labels.json`
-- `scripts/apply-labels.sh` reads classification results and applies Gmail labels via `gog`
-
-### Classification output format
-Write JSON to `cache/gmail-triage-labels.json` as an array of objects. Each object: `threadId` (string), `label` or `labels` (string or array), optional `needsReply` (boolean). Use only the labels listed above.
-
-### Classification context (customize for your inbox)
-When classifying, apply context that fits the user (e.g. work vs personal, domains, newsletters). Examples:
-- Newsletters / promos → Read Later
-- Account security / password / verification → Admin / Accounts
-- Time-sensitive or action-required → Urgent or Needs Reply as appropriate
-
-### Summary / notification rules (special handling)
-When summarizing or reporting emails, use these formats so the user gets a short, consistent line:
-
-- **Mansfield Business Alliance invoice paid:** If the subject contains `Mansfield Business Alliance — Invoice payment received`, summarize as: **MBA Invoice paid - [business_name]** where `[business_name]` is the business name taken from the email body (e.g. from the payment or merchant line). If no clear business name is in the body/snippet, use "MBA Invoice paid" or "MBA Invoice paid - (see email)".
-
 ## Files
-- Voice reference (auto-maintained): `references/voice.md`
-- Draft queue (generated): `cache/gmail-drafts.md`
-- Triage digest (generated): `cache/gmail-triage.md`
-- Inbox summaries (intermediate): `cache/gmail-inbox-summaries.json`
-- Classification results: `cache/gmail-triage-labels.json`
 
-Paths are relative to the OpenClaw workspace (e.g. `~/.openclaw/workspace`).
+Paths are relative to the OpenClaw workspace:
+
+- `cache/gmail-inbox-index.json`: metadata-first inbox index.
+- `cache/gmail-inbox-summaries.json`: compatibility array for older prompts.
+- `cache/gmail-thread-fetch-requests.json`: thread detail fetch requests.
+- `cache/gmail-thread-details.json`: selected full-thread context.
+- `cache/gmail-triage-plan.json`: structured triage and draft plan.
+- `cache/gmail-label-apply-report.json`: label mutation report.
+- `cache/gmail-drafts.md`: generated draft summary.
+- `cache/gmail-draft-results.json`: raw draft creation results.
+- `cache/gmail-triage.md`: optional human digest written by the agent.
+- `cache/gmail-voice-reference.md`: local style reference from Sent mail.
 
 ## Scripts
-- Build/refresh voice reference from Sent mail:
-  - `scripts/build-voice-reference.sh` (samples last 50 sent messages)
-- Fetch inbox + extract summaries:
-  - `scripts/triage-and-draft.sh`
-- Apply labels from classification:
-  - `scripts/apply-labels.sh`
 
-## Workflow
-1) Run `triage-and-draft.sh` — fetches inbox, extracts summaries to `cache/gmail-inbox-summaries.json`
-2) Ask the main agent to classify emails from that file and write `cache/gmail-triage-labels.json`
-3) Run `apply-labels.sh` — applies labels to Gmail threads via `gog`
-4) Optionally ask the agent to write a triage digest to `cache/gmail-triage.md` for nudges
+- `scripts/check-gmail-auth.sh`: verify host-side `gog`, config loading, and inbox access in one command.
+- `scripts/triage-and-draft.sh`: fetch inbox metadata and write the triage index.
+- `scripts/fetch-thread-details.sh`: fetch full thread context for requested thread IDs.
+- `scripts/apply-labels.sh`: validate the triage plan, ensure labels exist, and apply them.
+- `scripts/create-drafts.sh`: validate the triage plan and create or update Gmail drafts.
+- `scripts/build-voice-reference.sh`: build a local voice reference from recent Sent mail.
+
+## Future migration
+
+If you later want to replace `gog` with a first-party Gmail API adapter, keep the current JSON contracts stable and see `docs/direct-gmail-api-migration.md`.
+
+## Agent workflow
+
+Classification uses the main OpenClaw agent.
+
+For a more explicit host-script to agent handoff, plus a ready-to-use prompt outline, see `docs/openclaw-agent-workflow.md`.
+
+### Step 1. Build the inbox index
+
+Run:
+
+```bash
+./scripts/triage-and-draft.sh
+```
+
+Read `cache/gmail-inbox-index.json`. It contains one item per thread with:
+
+- `threadId`
+- `messageId`
+- `subject`
+- `from`
+- `date`
+- `snippet`
+- `labelIds`
+- `hasUnread`
+
+### Step 2. Fetch deeper context only when needed
+
+If a thread needs deeper reasoning, write `cache/gmail-thread-fetch-requests.json` as either:
+
+```json
+["thread-id-1", "thread-id-2"]
+```
+
+or:
+
+```json
+[
+  {"threadId": "thread-id-1", "reason": "Need full body to draft a reply"}
+]
+```
+
+Then run:
+
+```bash
+./scripts/fetch-thread-details.sh
+```
+
+Read `cache/gmail-thread-details.json` for the selected full-thread context.
+
+### Step 3. Write the triage plan
+
+Write JSON to `cache/gmail-triage-plan.json` using this shape:
+
+```json
+{
+  "generatedAt": "2026-03-08T12:00:00Z",
+  "items": [
+    {
+      "threadId": "thread-id",
+      "messageId": "latest-message-id",
+      "subject": "Re: Example",
+      "summary": "Short user-facing summary.",
+      "labels": ["Needs Reply"],
+      "action": "reply",
+      "draft": {
+        "subject": "Re: Example",
+        "body": "Thanks for the update. I can do Tuesday afternoon.",
+        "replyToMessageId": "latest-message-id",
+        "quote": true
+      }
+    }
+  ]
+}
+```
+
+Rules:
+
+- `action` must be `none`, `review`, or `reply`.
+- Use only the labels listed above.
+- `summary` should be concise and user-facing.
+- Include `draft` only when you want a Gmail draft created or updated.
+- When drafting a reply, prefer `replyToMessageId`.
+
+Legacy compatibility: `scripts/apply-labels.sh` still accepts the old `cache/gmail-triage-labels.json` format, but new work should use `cache/gmail-triage-plan.json`.
+
+### Step 4. Apply labels
+
+Run:
+
+```bash
+./scripts/apply-labels.sh
+```
+
+This validates the plan, creates missing labels, applies labels, and writes `cache/gmail-label-apply-report.json`.
+
+### Step 5. Create drafts
+
+Run:
+
+```bash
+./scripts/create-drafts.sh
+```
+
+This validates the plan, creates or updates drafts, and writes:
+
+- `cache/gmail-drafts.md`
+- `cache/gmail-draft-results.json`
+
+## Classification context
+
+Apply inbox-specific context when classifying:
+
+- Newsletters and promos -> Read Later
+- Account security, password, or verification mail -> Admin / Accounts
+- Time-sensitive or action-required mail -> Urgent or Needs Reply
+
+## Summary rules
+
+- If the subject contains `Mansfield Business Alliance — Invoice payment received`, summarize as `MBA Invoice paid - [business_name]` when the business name is available.
