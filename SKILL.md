@@ -124,7 +124,13 @@ Use only these labels:
 
 ## Files
 
-Paths are relative to the OpenClaw workspace:
+Paths are relative to the OpenClaw workspace unless noted.
+
+### Skill directory (`skills/gmail-secretary/`)
+
+- `triage-filters.json`: **Inbox ignore rules** before triage (sender tokens + subject/snippet regexes). Edit this to add or change noise filters without touching scripts. Optional env override: `GMAIL_SECRETARY_TRIAGE_FILTERS` pointing at another JSON file. If the file is missing or empty, no threads are filtered by this mechanism.
+
+### Workspace `cache/`
 
 - `cache/gmail-inbox-index.json`: metadata-first inbox index.
 - `cache/gmail-inbox-summaries.json`: compatibility array for older prompts.
@@ -266,6 +272,17 @@ Apply inbox-specific context when classifying:
 - Account security, password, or verification mail -> Admin / Accounts
 - Time-sensitive or action-required mail -> Urgent or Needs Reply
 
+### Filtered before triage (index step)
+
+`triage-and-draft.sh` loads **`triage-filters.json`** (see skill directory). Each rule requires:
+
+1. **`fromMatchesAny`**: at least one substring (case-insensitive) appears in the `From` header.
+2. **`subjectOrSnippetMatchesAny`**: at least one regex matches the combined subject + snippet.
+
+If the **latest message in the thread** matches any rule, the whole thread is omitted from `gmail-inbox-index.json`. The index includes `ignoredFilter` (config path, rule count, samples with `ruleId`).
+
+Default rules cover Mansfield Business Alliance / GrowthZone attendee and invoice-payment notifications; adjust the JSON for your mailbox.
+
 ## Summary rules
 
-- If the subject contains `Mansfield Business Alliance — Invoice payment received`, summarize as `MBA Invoice paid - [business_name]` when the business name is available.
+- Do not expect threads dropped by `triage-filters.json` to appear in the index; they are skipped before classification.

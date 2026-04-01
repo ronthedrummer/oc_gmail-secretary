@@ -15,6 +15,9 @@ SUMMARIES_OUT="$CACHE_DIR/gmail-inbox-summaries.json"
 TMP_INBOX="$(mktemp)"
 trap 'rm -f "$TMP_INBOX"' EXIT
 
+TRIAGE_FILTERS_JSON="${GMAIL_SECRETARY_TRIAGE_FILTERS:-$SKILL_DIR/triage-filters.json}"
+export TRIAGE_FILTERS_JSON
+
 "$GOG_BIN" gmail messages search \
   "$QUERY" \
   --max "$FETCH_MAX" \
@@ -84,6 +87,52 @@ function normalizeMessage(message) {
   };
 }
 
+function loadTriageFilterRules(configPath) {
+  if (!configPath || !fs.existsSync(configPath)) {
+    return [];
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    const rules = Array.isArray(raw.rules) ? raw.rules : [];
+    return rules
+      .filter((r) => r && typeof r.id === 'string')
+      .map((r) => ({
+        id: r.id,
+        description: typeof r.description === 'string' ? r.description : '',
+        fromMatchesAny: Array.isArray(r.fromMatchesAny) ? r.fromMatchesAny : [],
+        _re: (Array.isArray(r.subjectOrSnippetMatchesAny) ? r.subjectOrSnippetMatchesAny : [])
+          .map((s) => {
+            try {
+              return new RegExp(String(s), 'i');
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean)
+      }))
+      .filter((r) => r.fromMatchesAny.length > 0 && r._re.length > 0);
+  } catch (err) {
+    console.warn(`triage-filters.json: ${err.message}`);
+    return [];
+  }
+}
+
+function matchingIgnoreRule(normalized, rules) {
+  const fromLower = String(normalized.from || '').toLowerCase();
+  const blob = `${String(normalized.subject || '').toLowerCase()} ${String(normalized.snippet || '').toLowerCase()}`;
+  for (const rule of rules) {
+    if (!rule.fromMatchesAny.some((t) => fromLower.includes(String(t).toLowerCase()))) {
+      continue;
+    }
+    if (rule._re.some((re) => re.test(blob))) {
+      return rule;
+    }
+  }
+  return null;
+}
+
+const filterRules = loadTriageFilterRules(process.env.TRIAGE_FILTERS_JSON);
+
 const raw = readJson(process.env.TMP_INBOX);
 const sourceMessages = Array.isArray(raw) ? raw : (raw?.messages || raw?.items || raw?.threads || []);
 const perThread = new Map();
@@ -97,6 +146,25 @@ for (const message of sourceMessages) {
   if (!previous || normalized.internalDate >= previous.internalDate) {
     perThread.set(normalized.threadId, normalized);
   }
+}
+
+const ignoredSamples = [];
+let ignoredThreadCount = 0;
+for (const [threadId, normalized] of perThread) {
+  const matched = matchingIgnoreRule(normalized, filterRules);
+  if (!matched) {
+    continue;
+  }
+  ignoredThreadCount += 1;
+  if (ignoredSamples.length < 12) {
+    ignoredSamples.push({
+      threadId,
+      subject: normalized.subject,
+      from: normalized.from,
+      ruleId: matched.id
+    });
+  }
+  perThread.delete(threadId);
 }
 
 const threadLimit = Number(process.env.THREAD_LIMIT || 20);
@@ -119,6 +187,12 @@ const indexPayload = {
   generatedAt: new Date().toISOString(),
   query: process.env.QUERY,
   itemCount: items.length,
+  ignoredFilter: {
+    config: process.env.TRIAGE_FILTERS_JSON || null,
+    ruleCount: filterRules.length,
+    ignoredThreadCount,
+    sample: ignoredSamples
+  },
   items
 };
 

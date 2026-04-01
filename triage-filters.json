@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "mba-growthzone-routine",
+      "description": "Mansfield Business Alliance / GrowthZone: attendee and invoice payment notifications",
+      "fromMatchesAny": [
+        "growthzone",
+        "mansfield business alliance",
+        "mba-chamber"
+      ],
+      "subjectOrSnippetMatchesAny": [
+        "\\bnew attendees?\\s+registered\\b",
+        "\\binvoice\\s+payment\\s+received\\b"
+      ]
+    }
+  ]
+}
